@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>chord harness</title>
+<input id="typed">
+<div id="editable" contenteditable="true">note</div>
+<pre id="out">running</pre>
+<script src="../core.js"></script>
+<script>window.chrome = { runtime: { id: "test", sendMessage: async () => ({ ok: false, error: "stub" }) } };</script>
+<script src="../content.js"></script>
+<script>
+const results = [];
+function check(name, actual, expected) {
+  results.push(`${JSON.stringify(actual) === JSON.stringify(expected) ? "PASS" : "FAIL"} ${name} -> got ${JSON.stringify(actual)} want ${JSON.stringify(expected)}`);
+}
+function press(key, opts = {}) {
+  const target = opts.target || document.body;
+  delete opts.target;
+  const ev = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, composed: true, ...opts });
+  target.dispatchEvent(ev);
+  return ev.defaultPrevented;
+}
+function toast() {
+  const t = document.querySelector(".pr-link-copy-toast");
+  return t ? t.textContent : null;
+}
+function clearToast() {
+  const t = document.querySelector(".pr-link-copy-toast");
+  if (t) t.remove();
+}
+
+// 1. bare keys GitHub owns are left alone
+check("bare l passes through", press("l"), false);
+check("bare s passes through", press("s"), false);
+check("no toast from bare keys", toast(), null);
+
+// 2. c+l claims both keys and reports
+check("c is claimed", press("c"), true);
+check("l after c is claimed", press("l"), true);
+check("c+l reports", toast(), "Copy PR link is not ready yet");
+clearToast();
+
+// 3. c+s
+press("c");
+press("s");
+check("c+s reports", toast(), "Open the stack to copy it");
+clearToast();
+
+// 4. modifiers are ignored (cmd+c must still copy text)
+check("meta+c passes through", press("c", { metaKey: true }), false);
+check("ctrl+c passes through", press("c", { ctrlKey: true }), false);
+check("l after meta+c passes through", press("l"), false);
+check("no toast from modified keys", toast(), null);
+
+// 5. typing in an input is untouched
+const input = document.getElementById("typed");
+input.focus();
+check("c in input passes through", press("c", { target: input }), false);
+check("l in input passes through", press("l", { target: input }), false);
+check("no toast while typing", toast(), null);
+
+// 6. contenteditable (GitHub comment boxes) is untouched
+const editable = document.getElementById("editable");
+editable.focus();
+check("c in contenteditable passes through", press("c", { target: editable }), false);
+check("l in contenteditable passes through", press("l", { target: editable }), false);
+check("no toast while in comment box", toast(), null);
+document.body.focus();
+input.blur();
+editable.blur();
+
+// 7. an unrelated key cancels the chord
+press("c");
+check("x after c passes through", press("x"), false);
+check("l after cancelled chord passes through", press("l"), false);
+check("no toast after cancelled chord", toast(), null);
+
+// 8. the chord expires
+press("c");
+setTimeout(() => {
+  check("l after chord timeout passes through", press("l"), false);
+  check("no toast after timeout", toast(), null);
+
+  // 9. and still works after all that
+  press("c");
+  check("c+l still works", press("l"), true);
+  check("still reports", toast(), "Copy PR link is not ready yet");
+
+  document.getElementById("out").textContent = results.join("\n");
+}, 2000);
+</script>

@@ -1,0 +1,60 @@
+.pr-link-copy-button {
+  appearance: none;
+  background: var(--button-default-bgColor-rest, var(--color-btn-bg, #f6f8fa));
+  border: 1px solid var(--button-default-borderColor-rest, var(--color-btn-border, #d0d7de));
+  border-radius: 6px;
+  box-shadow: var(--button-default-shadow-resting, var(--color-btn-shadow, 0 1px 0 rgba(27, 31, 36, 0.04)));
+  color: var(--button-default-fgColor-rest, var(--color-btn-text, #24292f));
+  cursor: pointer;
+  flex: none;
+  font: 600 14px/20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 0 8px 0 0;
+  padding: 5px 12px;
+  vertical-align: middle;
+}
+
+.pr-link-copy-button:hover {
+  background: var(--button-default-bgColor-hover, var(--color-btn-hover-bg, #f3f4f6));
+}
+
+.pr-link-copy-button[data-state="success"] {
+  color: var(--fgColor-success, var(--color-success-fg, #1a7f37));
+}
+
+.pr-link-copy-button[data-state="error"] {
+  color: var(--fgColor-danger, var(--color-danger-fg, #cf222e));
+}
+
+.pr-link-copy-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.pr-stack-copy-button {
+  margin-left: 12px;
+}
+
+.pr-link-copy-toast {
+  background: var(--overlay-bgColor, var(--color-canvas-overlay, #ffffff));
+  border: 1px solid var(--borderColor-default, var(--color-border-default, #d0d7de));
+  border-radius: 6px;
+  box-shadow: var(--shadow-floating-small, 0 3px 6px rgba(140, 149, 159, 0.15));
+  color: var(--fgColor-default, var(--color-fg-default, #1f2328));
+  font: 600 12px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  inset: auto 16px 16px auto; /* Overrides the popover UA style, which centres it. */
+  margin: 0;
+  max-width: 320px;
+  padding: 8px 12px;
+  pointer-events: none;
+  position: fixed;
+  width: max-content;
+  z-index: 2147483000;
+}
+
+.pr-link-copy-toast[data-state="success"] {
+  color: var(--fgColor-success, var(--color-success-fg, #1a7f37));
+}
+
+.pr-link-copy-toast[data-state="error"] {
+  color: var(--fgColor-danger, var(--color-danger-fg, #cf222e));
+}

@@ -1,0 +1,89 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>e2e harness</title>
+<div class="gh-header-actions"></div>
+<pre id="out">running</pre>
+<script src="../core.js"></script>
+<script>
+const PR_URL = "https://github.com/microsoft/vscode/pull/200000";
+const DIFF = ["diff --git a/f b/f", "--- a/f", "+++ b/f", "@@ -1,2 +1,3 @@", "-old", "+new", "+another"].join("\n");
+let hovercardRequests = [];
+let copied = null;
+
+// Pretend this page is the PR page; everything else uses the real parser.
+const realParse = PrLinkCore.parsePrUrl;
+PrLinkCore.parsePrUrl = (value, base) => (value === location.href ? realParse(PR_URL) : realParse(value, base));
+
+// The diff comes back through the service worker; the title comes from a real captured hovercard.
+window.chrome = {
+  runtime: {
+    id: "test",
+    sendMessage: async (msg) => (PrLinkCore.isFetchablePrUrl(msg.url) && msg.url.endsWith(".diff")
+      ? { ok: true, text: DIFF }
+      : { ok: false, error: "unexpected url " + msg.url }),
+  },
+};
+
+window.fetch = async (url, options) => {
+  if (String(url).endsWith("/hovercard")) {
+    hovercardRequests.push({ url: String(url), headers: options && options.headers, credentials: options && options.credentials });
+    const fixture = await (await new XMLHttpRequestPromise("fixtures/hovercard.html")).text;
+    return { ok: true, text: async () => fixture };
+  }
+  return { ok: false, status: 599, text: async () => "" };
+};
+function XMLHttpRequestPromise(path) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", path);
+    xhr.onload = () => resolve({ text: xhr.responseText });
+    xhr.send();
+  });
+}
+
+// Headless virtual time does not run rAF callbacks; the extension's refresh is queued on one.
+window.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+
+Object.defineProperty(navigator, "clipboard", {
+  configurable: true,
+  value: { write: async (items) => { copied = items; } },
+});
+</script>
+<script src="../content.js"></script>
+<script>
+const results = [];
+function check(name, actual, expected) {
+  results.push(`${JSON.stringify(actual) === JSON.stringify(expected) ? "PASS" : "FAIL"} ${name}\n     got  ${JSON.stringify(actual)}\n     want ${JSON.stringify(expected)}`);
+}
+function press(key) {
+  document.body.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, composed: true }));
+}
+
+setTimeout(async () => {
+  const button = document.querySelector(".pr-link-copy-button");
+  check("button was injected", button && button.textContent, "Copy PR link");
+
+  press("c");
+  press("l");
+
+  setTimeout(async () => {
+    const toast = document.querySelector(".pr-link-copy-toast");
+    check("toast reports success", toast && toast.textContent, "Copied!");
+    check("toast is in the top layer, above modal dialogs", toast && toast.matches(":popover-open"), true);
+    check("hovercard was used instead of the full PR page", hovercardRequests.length, 1);
+    check("hovercard sends the header GitHub requires",
+      hovercardRequests[0] && hovercardRequests[0].headers["X-Requested-With"], "XMLHttpRequest");
+    check("hovercard sends session cookies",
+      hovercardRequests[0] && hovercardRequests[0].credentials, "include");
+
+    const text = copied ? await copied[0].getType("text/plain").then((b) => b.text()) : null;
+    const html = copied ? await copied[0].getType("text/html").then((b) => b.text()) : null;
+    check("clipboard markdown", text,
+      "[#200000 Apply font-variation-settings to the suggestion widget (fix #199954) `+2/-1`](https://github.com/microsoft/vscode/pull/200000)");
+    check("clipboard rich text", html,
+      "<a href=\"https://github.com/microsoft/vscode/pull/200000\">#200000 Apply font-variation-settings to the suggestion widget (fix #199954) <code>+2/-1</code></a>");
+
+    document.getElementById("out").textContent = results.join("\n");
+  }, 400);
+}, 100);
+</script>
