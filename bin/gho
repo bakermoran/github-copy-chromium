@@ -1,0 +1,1434 @@
+#!/usr/bin/env bash
+#
+# gho — a thin wrapper around the GitHub CLI that adds a Graphite-flavored
+# `gho stack` namespace on top of `gh stack` (github/gh-stack).
+#
+# Everything that is not `gho stack <overridden-verb>` is handed to `gh`
+# unchanged, so `gho pr list`, `gho repo view`, `gho stack push` all behave
+# exactly as they do under `gh`.
+#
+# The `gho stack` verbs, flags, and aliases mirror the Graphite CLI
+# (https://graphite.com/docs/cheatsheet) but are implemented with `gh stack`
+# plus plain git. Graphite flags with no `gh stack` counterpart fail loudly
+# rather than being silently ignored.
+#
+# Environment:
+#   GHO_DRY_RUN=1      print the commands that would run, run nothing
+#   GHO_STACK_JSON     use this instead of calling `gh stack view --json`
+#                     (used by the test suite; handy for debugging)
+
+set -euo pipefail
+
+GHO_VERSION="0.1.0"
+
+QUIET=0
+DEBUG=0
+INTERACTIVE=1
+VERIFY=1
+CWD=""
+DRY_RUN="${GHO_DRY_RUN:-0}"
+VERB="stack"
+ARGV=()
+
+[ -t 1 ] || INTERACTIVE=0
+
+# ---------------------------------------------------------------- primitives
+
+die() { printf 'gho: %s\n' "$*" >&2; exit 1; }
+
+unsupported() { die "stack $VERB: $*"; }
+
+note() {
+  if [ "$QUIET" != 1 ]; then printf '%s\n' "$*" >&2; fi
+}
+
+# Shell-quote one argument for human-readable traces.
+shq() {
+  case "$1" in
+    '') printf "''" ;;
+    *[!A-Za-z0-9_./:=@,+-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+trace() {
+  local out="+" a
+  for a in "$@"; do out="$out $(shq "$a")"; done
+  printf '%s\n' "$out" >&2
+}
+
+# Run a command, honoring --debug and GHO_DRY_RUN.
+run() {
+  if [ "$DEBUG" = 1 ] || [ "$DRY_RUN" = 1 ]; then trace "$@"; fi
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  "$@"
+}
+
+# Replace this process, unless we are only tracing.
+run_exec() {
+  if [ "$DEBUG" = 1 ] || [ "$DRY_RUN" = 1 ]; then trace "$@"; fi
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  exec "$@"
+}
+
+confirm() {
+  if [ "$INTERACTIVE" != 1 ]; then return 0; fi
+  local reply=""
+  printf '%s [y/N] ' "$1" >&2
+  read -r reply || true
+  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) die "aborted" ;; esac
+}
+
+require_git_repo() {
+  git rev-parse --absolute-git-dir >/dev/null 2>&1 || die "not a git repository"
+}
+
+# --------------------------------------------------------------- dependencies
+
+GIT_MIN="2.35"          # git stash push --staged, used by `modify --into`
+
+have_gh_stack() {
+  gh extension list 2>/dev/null | grep -q 'gh[[:space:]]*stack'
+}
+
+have_json_reader() {
+  command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1
+}
+
+# Fail before doing any work, naming the fix for each missing piece.
+require_deps() {
+  local missing=0
+  if ! command -v git >/dev/null 2>&1; then
+    printf 'gho: git is required\n' >&2
+    missing=1
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    printf 'gho: the GitHub CLI is required\n      brew install gh && gh auth login\n' >&2
+    missing=1
+  elif ! have_gh_stack; then
+    printf 'gho: the gh-stack extension is required\n      gh extension install github/gh-stack\n' >&2
+    missing=1
+  fi
+  if ! have_json_reader; then
+    printf 'gho: jq or python3 is required, to read the stack layout\n      brew install jq\n' >&2
+    missing=1
+  fi
+  if [ "$missing" != 0 ]; then
+    die "missing dependencies — 'gho doctor' lists them, bin/install.sh installs them"
+  fi
+}
+
+report() { # $1 = ok|bad|note, $2 = label, $3 = detail
+  case "$1" in
+    ok)   printf '  ok       %-20s %s\n' "$2" "$3" ;;
+    note) printf '  note     %-20s %s\n' "$2" "$3" ;;
+    *)    printf '  MISSING  %-20s %s\n' "$2" "$3" ;;
+  esac
+}
+
+cmd_doctor() {
+  local bad=0 v
+  printf 'gho %s\n\n' "$GHO_VERSION"
+  report ok "bash" "${BASH_VERSION:-unknown}"
+
+  if command -v git >/dev/null 2>&1; then
+    v="$(git version | awk '{print $3}')"
+    if git_version_at_least "$GIT_MIN"; then
+      report ok "git" "$v"
+    else
+      report bad "git" "$v — 'modify --into' needs $GIT_MIN or newer"
+      bad=1
+    fi
+  else
+    report bad "git" "not on PATH"
+    bad=1
+  fi
+
+  if command -v gh >/dev/null 2>&1; then
+    report ok "gh" "$(gh --version | head -1 | awk '{print $3}')"
+    if have_gh_stack; then
+      report ok "gh-stack extension" "$(gh stack --version 2>/dev/null | awk '{print $NF}')"
+    else
+      report bad "gh-stack extension" "gh extension install github/gh-stack"
+      bad=1
+    fi
+    if gh auth status >/dev/null 2>&1; then
+      report ok "gh auth" "logged in"
+    else
+      report bad "gh auth" "gh auth login"
+      bad=1
+    fi
+  else
+    report bad "gh" "brew install gh"
+    report bad "gh-stack extension" "needs gh first"
+    bad=1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    report ok "jq or python3" "jq $(jq --version | sed 's/^jq-//')"
+  elif command -v python3 >/dev/null 2>&1; then
+    report ok "jq or python3" "$(python3 --version)"
+  else
+    report bad "jq or python3" "brew install jq"
+    bad=1
+  fi
+
+  # Not a dependency, just worth knowing.
+  v="$(command -v gho 2>/dev/null || true)"
+  if [ -n "$v" ]; then
+    report ok "gho on PATH" "$v"
+  else
+    report note "gho on PATH" "not linked yet — bin/install.sh does that"
+  fi
+
+  printf '\n'
+  if [ "$bad" = 0 ]; then
+    printf 'Everything gho needs is here.\n'
+  else
+    printf 'Fix the lines above, or run bin/install.sh.\n'
+    return 1
+  fi
+}
+
+git_version_at_least() { # $1 = x.y
+  local have want
+  have="$(git version | awk '{print $3}')"
+  want="$1"
+  [ "$(printf '%s\n%s\n' "$want" "$have" | sort -t. -k1,1n -k2,2n | head -1)" = "$want" ]
+}
+
+# ------------------------------------------------------------ stack topology
+
+_STACK_JSON=""
+
+stack_json() {
+  if [ -z "$_STACK_JSON" ]; then
+    if [ -n "${GHO_STACK_JSON:-}" ]; then
+      _STACK_JSON="$GHO_STACK_JSON"
+    else
+      _STACK_JSON="$(gh stack view --json 2>/dev/null)" ||
+        die "the current branch is not part of a stack — start one with 'gho stack create <name>'"
+    fi
+  fi
+  printf '%s' "$_STACK_JSON"
+}
+
+in_stack() {
+  if [ -n "${GHO_STACK_JSON:-}" ]; then return 0; fi
+  gh stack view --json >/dev/null 2>&1
+}
+
+_json_extract() { # $1 = mode, $2 = argument
+  if command -v jq >/dev/null 2>&1; then
+    case "$1" in
+      trunk)   jq -r '.trunk // ""' ;;
+      current) jq -r '.currentBranch // ""' ;;
+      names)   jq -r '.branches[]?.name' ;;
+      merged)  jq -r '.branches[]? | select(.isMerged) | .name' ;;
+      base)    jq -r --arg n "$2" '.branches[]? | select(.name==$n) | .base' ;;
+    esac
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" "${2:-}" <<'PY'
+import json, sys
+d = json.load(sys.stdin)
+mode, arg = sys.argv[1], sys.argv[2]
+bs = d.get("branches") or []
+if mode == "trunk":     print(d.get("trunk", ""))
+elif mode == "current": print(d.get("currentBranch", ""))
+elif mode == "names":   [print(b["name"]) for b in bs]
+elif mode == "merged":  [print(b["name"]) for b in bs if b.get("isMerged")]
+elif mode == "base":    [print(b["base"]) for b in bs if b.get("name") == arg]
+PY
+  else
+    die "reading stack topology needs jq or python3 on PATH"
+  fi
+}
+
+stack_field() { stack_json | _json_extract "$1" "${2:-}"; }
+
+current_branch() {
+  local b
+  b="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [ -n "$b" ] || die "HEAD is detached"
+  printf '%s' "$b"
+}
+
+# The branch below $1 in the stack, or the trunk if $1 sits on it.
+stack_parent() {
+  local target="$1" prev name
+  prev="$(stack_field trunk)"
+  while IFS= read -r name; do
+    if [ "$name" = "$target" ]; then printf '%s' "$prev"; return 0; fi
+    prev="$name"
+  done <<EOF
+$(stack_field names)
+EOF
+  die "branch '$target' is not in the current stack"
+}
+
+# The base commit gh-stack recorded for branch $1.
+stack_base() {
+  local base
+  base="$(stack_field base "$1")"
+  [ -n "$base" ] || die "branch '$1' is not in the current stack"
+  printf '%s' "$base"
+}
+
+is_downstack_of() { # $1 = candidate, $2 = reference
+  local name
+  while IFS= read -r name; do
+    if [ "$name" = "$2" ]; then return 1; fi
+    if [ "$name" = "$1" ]; then return 0; fi
+  done <<EOF
+$(stack_field names)
+EOF
+  return 1
+}
+
+# Save every stack branch tip so `gho stack undo` can put them back. Only used
+# by verbs that rewrite commits; verbs that change the shape of the stack are
+# delegated to `gh stack` itself, which has its own --abort.
+snapshot() { # $1 = label
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  if ! in_stack; then return 0; fi
+  local dir file name
+  dir="$(git rev-parse --absolute-git-dir)/gho/undo"
+  mkdir -p "$dir"
+  file="$dir/$(date +%s).$$"
+  {
+    printf '# %s\n' "$1"
+    printf '%s\t%s\n' "HEAD-branch" "$(current_branch)"
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      printf '%s\t%s\n' "$name" "$(git rev-parse "$name")"
+    done <<EOF
+$(printf '%s\n%s\n' "$(stack_field trunk)" "$(stack_field names)")
+EOF
+  } >"$file"
+  # Keep the ten most recent snapshots.
+  local old
+  for old in $(ls -1t "$dir" 2>/dev/null | tail -n +11 || true); do
+    rm -f "$dir/$old"
+  done
+}
+
+# ------------------------------------------------------------- option syntax
+
+# Expand clustered boolean shorts (-am -> -a -m) so `gho stack m -am "msg"`
+# works the way it does in Graphite.
+expand_shorts() {
+  ARGV=()
+  local a rest ch
+  for a in "$@"; do
+    case "$a" in
+      -[A-Za-z][A-Za-z]*)
+        case "$a" in
+          *[!-A-Za-z]*) ARGV+=("$a"); continue ;;
+        esac
+        rest="${a#-}"
+        while [ -n "$rest" ]; do
+          ch="${rest%"${rest#?}"}"
+          ARGV+=("-$ch")
+          rest="${rest#?}"
+        done
+        ;;
+      *) ARGV+=("$a") ;;
+    esac
+  done
+}
+
+# Pull Graphite's global options out of the argument list.
+parse_globals() {
+  local rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd)             CWD="${2:-}"; shift 2 ;;
+      --cwd=*)           CWD="${1#*=}"; shift ;;
+      --debug)           DEBUG=1; shift ;;
+      -q|--quiet)        QUIET=1; INTERACTIVE=0; shift ;;
+      --interactive)     INTERACTIVE=1; shift ;;
+      --no-interactive)  INTERACTIVE=0; shift ;;
+      --verify)          VERIFY=1; shift ;;
+      --no-verify)       VERIFY=0; shift ;;
+      --)                shift; while [ $# -gt 0 ]; do rest+=("$1"); shift; done ;;
+      *)                 rest+=("$1"); shift ;;
+    esac
+  done
+  ARGV=(${rest[@]+"${rest[@]}"})
+}
+
+need_value() { # $1 = flag, $2 = value
+  [ -n "${2:-}" ] || die "stack $VERB: $1 needs a value"
+}
+
+# --------------------------------------------------------- staging & commits
+
+STAGE_MODE=""   # all | update | patch
+
+set_stage_mode() {
+  if [ -n "$STAGE_MODE" ] && [ "$STAGE_MODE" != "$1" ]; then
+    unsupported "--all, --update and --patch are mutually exclusive"
+  fi
+  STAGE_MODE="$1"
+}
+
+do_stage() {
+  case "$STAGE_MODE" in
+    all)    run git add -A ;;
+    update) run git add -u ;;
+    patch)
+      [ "$INTERACTIVE" = 1 ] || unsupported "--patch needs an interactive terminal"
+      run git add -p
+      ;;
+  esac
+}
+
+has_staged_changes() {
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  ! git diff --cached --quiet
+}
+
+# Repeated -m values, in order, and the `git commit` invocation being built.
+MESSAGES=()
+COMMIT=()
+
+# Echo `-m <msg>` pairs into the caller's COMMIT array.
+append_messages() { # $1 = name of the array to append to (COMMIT)
+  local m
+  for m in ${MESSAGES[@]+"${MESSAGES[@]}"}; do COMMIT+=(-m "$m"); done
+}
+
+# ---------------------------------------------------------------------- help
+
+top_help() {
+  cat <<'EOF'
+gho — the GitHub CLI, plus a Graphite-flavored stack namespace.
+
+Usage:
+  gho <gh command> [args...]     forwarded to `gh` verbatim
+  gho stack <verb> [args...]     Graphite-style stack commands
+  gho stack --help               list the stack verbs
+  gho doctor                     check that everything gho needs is installed
+  gho --version                  versions of gho, gh and gh-stack
+
+Anything gho does not override is `gh`, so `gho pr create`, `gho repo clone`
+and `gho stack push` are the ordinary gh commands.
+
+Requires gh with the github/gh-stack extension, git 2.35+, and jq or python3.
+bin/install.sh checks for all of them.
+EOF
+}
+
+stack_help() {
+  cat <<'EOF'
+gho stack — Graphite's stack commands, implemented with `gh stack` and git.
+
+Creating and changing branches
+  create, c [name]      new branch on top of the stack, committing staged work
+  modify, m             amend (or add to) this branch's commit, then rebase
+  squash, sq            squash this branch's commits into one, then restack
+  restructure           gh's interactive stack editor (`gh stack modify`)
+
+Syncing and submitting
+  sync                  pull and cascade-rebase the stack (`gh stack rebase`)
+  restack, r            rebase each branch onto its parent, leaving trunk alone
+  submit, s / ss        push branches and create or update the stack's PRs
+  get [branch|pr]       fetch someone else's stack and check it out
+
+Looking around
+  log / ls / ll         show the stack (ll shows commit ancestry)
+  checkout, co [branch] switch branches within the stack
+  up, u / down, d       move one branch (or [n]) up or down the stack
+  top, t / bottom, b    jump to either end of the stack
+  trunk                 check out the stack's trunk
+
+Recovering
+  continue / abort      resume or abandon a conflicted rebase
+  undo                  restore branch tips as they were before the last
+                        commit-rewriting `gho stack` command
+
+Tracking
+  track, tr [branch]    adopt existing branches into a stack (`gh stack init`)
+  untrack, utr          drop local stack tracking (`gh stack unstack --local`)
+
+Structural edits (fold, pop, move, reorder, rename, split, delete) are done in
+gh's interactive stack editor; those verbs explain themselves and open it.
+
+Any other verb is passed to `gh stack` unchanged — push, merge, view, link,
+init, unstack, switch, alias all keep their normal behavior.
+
+`gho stack <verb> --help` describes one verb, including which Graphite flags it
+accepts and what it runs. Set GHO_DRY_RUN=1 to see commands without running any.
+EOF
+}
+
+verb_help() {
+  case "$1" in
+    create|c) cat <<'EOF'
+gho stack create [name]            alias: c
+  Creates a branch on top of the stack and commits staged changes.
+  Runs `gh stack add <name>` (or `gh stack init` when no stack exists yet),
+  then stages and commits with git.
+
+  -m, --message <msg>   commit message; repeatable, joined like git's -m
+  -a, --all             stage everything, including untracked files
+  -u, --update          stage tracked files only
+  -p, --patch           pick hunks to stage
+  -o, --onto <branch>   check out <branch> first, so the branch lands there
+  -v, --verbose         show the diff in the commit message template
+      --no-verify       skip git hooks
+
+  Unsupported: -i/--insert (use `gho stack restructure`), --ai/--no-ai.
+  With no [name] the branch name comes from -m, via `gh stack add -m`.
+EOF
+    ;;
+    modify|m) cat <<'EOF'
+gho stack modify                   alias: m
+  Amends this branch's commit and restacks its descendants, as Graphite does:
+  `git commit --amend --no-edit` then `gh stack rebase --upstack --no-trunk`.
+  Trunk is left alone — `gho stack sync` is what pulls it.
+
+  -c, --commit            add a new commit instead of amending
+  -a, --all               stage everything, including untracked files
+  -u, --update            stage tracked files only
+  -p, --patch             pick hunks to stage
+  -m, --message <msg>     message for the new or amended commit; repeatable
+  -e, --edit              open an editor for the amended message
+      --reset-author      take over authorship when amending
+      --into <branch>     amend into a branch further down the stack instead
+      --interactive-rebase  ignore other flags; `git rebase -i` this branch
+      --no-verify         skip git hooks
+      --upstack, --downstack, --no-trunk
+                          replace the follow-up rebase's default scope, which
+                          is --upstack --no-trunk
+      --abort, --continue forwarded to `gh stack modify`, gh's stack editor
+
+  -v/--verbose is accepted and passed to git commit.
+EOF
+    ;;
+    sync) cat <<'EOF'
+gho stack sync
+  Pulls from the remote and cascade-rebases the stack: `gh stack rebase`.
+
+      --no-restack     only fetch; skip the rebase
+  -d, --delete-all     use `gh stack sync --prune` instead, which also deletes
+                       local branches for merged PRs (and pushes, as gh's sync
+                       does — Graphite's sync does not push)
+      --remote <name>  remote to fetch from
+      --continue, --abort   forwarded to `gh stack rebase`
+  -f, --force          accepted; `gh stack rebase` never prompts anyway
+
+  Unsupported: -a/--all (Graphite's multi-trunk sync has no gh equivalent).
+EOF
+    ;;
+    restack|r) cat <<'EOF'
+gho stack restack                  alias: r
+  Ensures every branch has its parent in its history, without touching trunk:
+  `gh stack rebase --no-trunk`.
+
+  -d, --downstack        only trunk..current      (--downstack --no-trunk)
+  -u, --upstack          only current..top        (--upstack --no-trunk)
+  -o, --only             only this branch, via `git rebase --onto <parent>`
+      --branch <branch>  run as if that branch were checked out, then come back
+      --remote <name>, --preserve-dates, --continue, --abort
+                         forwarded to `gh stack rebase`
+EOF
+    ;;
+    submit|s|ss) cat <<'EOF'
+gho stack submit                   aliases: s, ss (= submit --stack)
+  Pushes the stack's branches and creates or updates its PRs:
+  `gh stack submit`. gh always submits the whole stack.
+
+  -d, --draft                new PRs as drafts        (`--auto` without --open)
+  -p, --publish              mark PRs ready for review (`--open`)
+  -n, --no-edit              skip gh's editor, auto-generate titles (`--auto`)
+  -e, --edit                 use gh's interactive editor (the default)
+      --restack              `gh stack rebase --no-trunk` first
+  -u, --update-only          push branches only, open no PRs (`gh stack push`)
+  -r, --reviewers a,b        `gh pr edit --add-reviewer` on each stack branch
+  -t, --team-reviewers a,b   same, with --add-reviewer org/team
+      --comment <msg>        comment on the current branch's PR afterwards
+  -v, --view                 open the current branch's PR in a browser
+      --dry-run              print the plan and stop
+  -c, --confirm              print the plan and ask before running it
+      --remote <name>        remote to push to
+  -s, --stack                accepted; gh submits the whole stack already
+
+  Unsupported: --no-stack, -f/--force, --always, --ai/--no-ai, --edit-title
+  and friends, -m/--merge-when-ready (see `gho stack merge`), -w/--web, --cli,
+  --target-trunk, --ignore-out-of-sync-trunk, --branch, --rerequest-review.
+EOF
+    ;;
+    log|ls|ll) cat <<'EOF'
+gho stack log [short|long]         aliases: ls (log short), ll (log long)
+  log, log short   `gh stack view` / `gh stack view --short`
+  log long         `git log --graph --oneline --decorate` over the stack
+
+  -r, --reverse    print the stack upside down
+      --json       `gh stack view --json`
+  -s, --stack      accepted; `gh stack view` is already stack-scoped
+
+  Unsupported: --classic, -n/--steps, -u/--show-untracked, -a/--all.
+EOF
+    ;;
+    checkout|co) cat <<'EOF'
+gho stack checkout [branch]        alias: co
+  With an argument, `gh stack checkout <branch|pr|url|stack-number>`.
+  With none, `gh stack switch` — gh's interactive picker.
+
+  -t, --trunk    check out the trunk (`gh stack trunk`)
+  -s, --stack    accepted; gh's picker is already stack-scoped
+
+  Unsupported: -u/--show-untracked, -a/--all.
+EOF
+    ;;
+    up|u|down|d) cat <<'EOF'
+gho stack up [n]                   alias: u
+gho stack down [n]                 alias: d
+  `gh stack up [n]` / `gh stack down [n]`. Merged branches are skipped.
+
+  -n, --steps <n>   how many branches to move
+
+  Unsupported: --to (use `gho stack checkout <branch>`).
+EOF
+    ;;
+    squash|sq) cat <<'EOF'
+gho stack squash                   alias: sq
+  Squashes this branch's commits into one and restacks what is above it:
+  `git reset --soft <base>`, commit, then `gh stack rebase --upstack --no-trunk`.
+
+  -m, --message <msg>   message for the squashed commit; repeatable
+  -n, --no-edit         reuse the existing messages without an editor
+      --edit            open an editor pre-filled with them (the default)
+
+  Requires a clean working tree, so that only committed work is squashed.
+EOF
+    ;;
+    undo) cat <<'EOF'
+gho stack undo
+  Restores every stack branch tip to where it was before the last
+  commit-rewriting `gho stack` command (modify, squash, create, restack, sync).
+
+  -f, --force   don't ask for confirmation
+
+  Snapshots live in .git/gho/undo; the last ten are kept. This does not
+  undo changes to the shape of the stack — those go through `gh stack`, which
+  has `gh stack modify --abort` and `gh stack rebase --abort`.
+EOF
+    ;;
+    get) cat <<'EOF'
+gho stack get [branch|pr|url]
+  Fetches a stack from the remote and checks it out: `gh stack checkout`.
+
+      --no-checkout    return to the branch you started on
+      --no-restack     skip the `gh stack rebase` that follows
+      --delete-all     `gh stack sync --prune` afterwards
+  -f, --force          accepted; gh takes the remote as the source of truth
+
+  Unsupported: -d/--downstack, -u/--remote-upstack, -U/--unfrozen.
+EOF
+    ;;
+    track|tr|untrack|utr) cat <<'EOF'
+gho stack track [branch...]        alias: tr
+  Adopts existing branches into a stack: `gh stack init <branch...>`.
+  -p, --parent <branch>   use that branch as the stack's base (`--base`)
+
+gho stack untrack                  alias: utr
+  `gh stack unstack --local`. Note the difference from Graphite: this drops
+  local tracking for the whole stack, not for one branch.
+EOF
+    ;;
+    continue|abort) cat <<'EOF'
+gho stack continue
+  `gh stack rebase --continue`.
+  -a, --all   stage everything first
+
+gho stack abort
+  `gh stack rebase --abort`.
+  -f, --force   don't ask for confirmation
+EOF
+    ;;
+    restructure) cat <<'EOF'
+gho stack restructure
+  Opens gh's interactive stack editor, `gh stack modify`, which drops, folds,
+  inserts, reorders and renames branches. `gho stack modify` is Graphite's
+  amend command, so this verb is how you reach gh's version.
+
+      --abort, --continue   forwarded to `gh stack modify`
+EOF
+    ;;
+    fold|pop|move|reorder|rename|delete|split|sp|insert) cat <<'EOF'
+Structural stack edits
+  gh-stack has no non-interactive fold/pop/move/reorder/rename/split. Its
+  stack editor does all of them at once, and it is the only thing that keeps
+  gh's own stack metadata consistent, so these verbs open it:
+
+      gho stack restructure     (`gh stack modify`)
+
+  `gho stack pop` is the exception: it prints the two steps to run, because
+  keeping the changes in your working tree happens before the branch is
+  dropped.
+EOF
+    ;;
+    absorb|ab) cat <<'EOF'
+gho stack absorb                   alias: ab
+  Not supported. Graphite works out which downstack commit each staged hunk
+  belongs to; nothing in gh-stack or git does that attribution, and guessing
+  it would quietly amend the wrong commits.
+
+  To amend staged changes into a branch you name yourself:
+      gho stack modify --into <branch>
+EOF
+    ;;
+    freeze|unfreeze) cat <<'EOF'
+gho stack freeze / unfreeze
+  Not supported. Freezing is a Graphite metadata concept; gh-stack has no
+  equivalent, so there is nothing to map it onto.
+EOF
+    ;;
+    *) return 1 ;;
+  esac
+}
+
+wants_help() {
+  local a
+  for a in "$@"; do
+    case "$a" in -h|--help|help) return 0 ;; --) return 1 ;; esac
+  done
+  return 1
+}
+
+# --------------------------------------------------------------------- verbs
+
+cmd_create() {
+  local name="" onto="" verbose=()
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--message)   need_value "$1" "${2:-}"; MESSAGES+=("$2"); shift 2 ;;
+      --message=*)    MESSAGES+=("${1#*=}"); shift ;;
+      -a|--all)       set_stage_mode all; shift ;;
+      -u|--update)    set_stage_mode update; shift ;;
+      -p|--patch)     set_stage_mode patch; shift ;;
+      -o|--onto)      need_value "$1" "${2:-}"; onto="$2"; shift 2 ;;
+      --onto=*)       onto="${1#*=}"; shift ;;
+      -v|--verbose)   verbose+=("-v"); shift ;;
+      -i|--insert)    unsupported "-i/--insert has no gh stack equivalent; insert the branch with 'gho stack restructure'" ;;
+      --ai|--no-ai)   unsupported "$1 has no gh stack equivalent; write the branch name and message yourself" ;;
+      -*)             unsupported "unknown flag $1 (see 'gho stack create --help')" ;;
+      *)              [ -z "$name" ] || unsupported "only one branch name is accepted"; name="$1"; shift ;;
+    esac
+  done
+
+  require_git_repo
+
+  # With no branch name, gh derives one from the commit message, so the commit
+  # has to be gh's rather than ours.
+  if [ -z "$name" ]; then
+    if [ ${#MESSAGES[@]} -eq 0 ]; then
+      unsupported "give a branch name, or -m <msg> to have gh generate one from it"
+    fi
+    if [ ${#verbose[@]} -gt 0 ] || [ "$STAGE_MODE" = patch ]; then
+      unsupported "-v and -p need an explicit branch name, so that gho makes the commit"
+    fi
+    local joined="" m
+    for m in "${MESSAGES[@]}"; do
+      if [ -z "$joined" ]; then joined="$m"; else joined="$joined
+
+$m"; fi
+    done
+    local add=(gh stack add -m "$joined")
+    case "$STAGE_MODE" in all) add+=(-A) ;; update) add+=(-u) ;; esac
+    [ -z "$onto" ] || run gh stack checkout "$onto"
+    run "${add[@]}"
+    return 0
+  fi
+
+  [ -z "$onto" ] || run gh stack checkout "$onto"
+
+  if in_stack; then
+    snapshot "create $name"
+    run gh stack add "$name"
+  else
+    note "no stack here yet — starting one with 'gh stack init'"
+    run gh stack init "$name"
+  fi
+
+  do_stage
+  if has_staged_changes; then
+    COMMIT=(git commit)
+    [ "$VERIFY" = 1 ] || COMMIT+=(--no-verify)
+    COMMIT+=(${verbose[@]+"${verbose[@]}"})
+    append_messages
+    run "${COMMIT[@]}"
+  else
+    note "nothing staged — created '$name' as an empty branch"
+  fi
+}
+
+cmd_modify() {
+  local new_commit=0 edit=0 reset_author=0 interactive_rebase=0 into=""
+  local verbose=() rebase_scope=()
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--commit)          new_commit=1; shift ;;
+      -a|--all)             set_stage_mode all; shift ;;
+      -u|--update)          set_stage_mode update; shift ;;
+      -p|--patch)           set_stage_mode patch; shift ;;
+      -m|--message)         need_value "$1" "${2:-}"; MESSAGES+=("$2"); shift 2 ;;
+      --message=*)          MESSAGES+=("${1#*=}"); shift ;;
+      -e|--edit)            edit=1; shift ;;
+      --reset-author)       reset_author=1; shift ;;
+      --interactive-rebase) interactive_rebase=1; shift ;;
+      --into)               need_value "$1" "${2:-}"; into="$2"; shift 2 ;;
+      --into=*)             into="${1#*=}"; shift ;;
+      -v|--verbose)         verbose+=("-v"); shift ;;
+      --upstack|--downstack|--no-trunk) rebase_scope+=("$1"); shift ;;
+      --abort|--continue)   run_exec gh stack modify "$1"; return 0 ;;
+      -*)                   unsupported "unknown flag $1 (see 'gho stack modify --help')" ;;
+      *)                    unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  require_git_repo
+  local branch
+  branch="$(current_branch)"
+
+  # Graphite's modify restacks only this branch's descendants, and never pulls
+  # trunk. Passing any scoping flag replaces that default wholesale.
+  if [ ${#rebase_scope[@]} -eq 0 ]; then
+    rebase_scope=(--upstack --no-trunk)
+  fi
+
+  if [ "$interactive_rebase" = 1 ]; then
+    snapshot "modify --interactive-rebase $branch"
+    run git rebase -i "$(stack_base "$branch")"
+    run gh stack rebase "${rebase_scope[@]}"
+    return 0
+  fi
+
+  if [ -n "$into" ]; then
+    modify_into "$into" "$branch" ${rebase_scope[@]+"${rebase_scope[@]}"}
+    return 0
+  fi
+
+  do_stage
+
+  # A branch with no commits of its own can only take a new commit.
+  if [ "$new_commit" != 1 ] && [ "$DRY_RUN" != 1 ] && in_stack; then
+    if [ "$(git rev-parse HEAD)" = "$(stack_base "$branch")" ]; then
+      note "'$branch' has no commits yet — creating one instead of amending"
+      new_commit=1
+    fi
+  fi
+
+  snapshot "modify $branch"
+
+  COMMIT=(git commit)
+  [ "$VERIFY" = 1 ] || COMMIT+=(--no-verify)
+  COMMIT+=(${verbose[@]+"${verbose[@]}"})
+
+  if [ "$new_commit" = 1 ]; then
+    append_messages
+  else
+    COMMIT+=(--amend)
+    [ "$reset_author" != 1 ] || COMMIT+=(--reset-author)
+    if [ ${#MESSAGES[@]} -gt 0 ]; then
+      append_messages
+    elif [ "$edit" = 1 ]; then
+      COMMIT+=(--edit)
+    else
+      COMMIT+=(--no-edit)
+    fi
+  fi
+
+  run "${COMMIT[@]}"
+  run gh stack rebase "${rebase_scope[@]}"
+}
+
+# Amend staged changes into a branch further down the stack.
+modify_into() {
+  local target="$1" origin="$2"; shift 2
+  local scope=(${@+"$@"})
+
+  git_version_at_least 2.35 ||
+    die "stack modify --into needs git 2.35 or newer for 'git stash push --staged'"
+  in_stack || die "the current branch is not part of a stack"
+  is_downstack_of "$target" "$origin" ||
+    die "stack modify: '$target' is not below '$origin' in this stack"
+  do_stage
+  has_staged_changes || die "stack modify --into: nothing is staged"
+
+  snapshot "modify --into $target"
+  run git stash push --staged -m "gho stack modify --into $target"
+  run gh stack checkout "$target"
+  run git stash pop --index
+  local commit=(git commit --amend --no-edit)
+  [ "$VERIFY" = 1 ] || commit+=(--no-verify)
+  run "${commit[@]}"
+  run gh stack rebase ${scope[@]+"${scope[@]}"}
+  run gh stack checkout "$origin"
+}
+
+cmd_sync() {
+  local restack=1 prune=0 rebase=(gh stack rebase)
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --restack)            restack=1; shift ;;
+      --no-restack)         restack=0; shift ;;
+      -d|--delete-all)      prune=1; shift ;;
+      --remote)             need_value "$1" "${2:-}"; rebase+=(--remote "$2"); shift 2 ;;
+      --remote=*)           rebase+=(--remote "${1#*=}"); shift ;;
+      --continue|--abort)   run_exec gh stack rebase "$1"; return 0 ;;
+      -f|--force)           shift ;;   # gh stack rebase never prompts
+      -a|--all)             unsupported "-a/--all syncs every configured trunk, which gh stack has no notion of" ;;
+      -*)                   unsupported "unknown flag $1 (see 'gho stack sync --help')" ;;
+      *)                    unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  require_git_repo
+
+  if [ "$restack" = 0 ]; then
+    note "--no-restack: fetching only"
+    run git fetch --prune
+    return 0
+  fi
+
+  snapshot "sync"
+
+  if [ "$prune" = 1 ]; then
+    note "--delete-all: using 'gh stack sync --prune', which also pushes"
+    run gh stack sync --prune
+    return 0
+  fi
+
+  run "${rebase[@]}"
+}
+
+cmd_restack() {
+  local scope="" branch="" extra=()
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d|--downstack)      scope="downstack"; shift ;;
+      -u|--upstack)        scope="upstack"; shift ;;
+      -o|--only)           scope="only"; shift ;;
+      --branch)            need_value "$1" "${2:-}"; branch="$2"; shift 2 ;;
+      --branch=*)          branch="${1#*=}"; shift ;;
+      --remote)            need_value "$1" "${2:-}"; extra+=(--remote "$2"); shift 2 ;;
+      --remote=*)          extra+=(--remote "${1#*=}"); shift ;;
+      --preserve-dates|--committer-date-is-author-date) extra+=("$1"); shift ;;
+      --continue|--abort)  run_exec gh stack rebase "$1"; return 0 ;;
+      -*)                  unsupported "unknown flag $1 (see 'gho stack restack --help')" ;;
+      *)                   unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  require_git_repo
+  local origin=""
+  if [ -n "$branch" ]; then
+    origin="$(current_branch)"
+    run gh stack checkout "$branch"
+  fi
+
+  snapshot "restack"
+
+  case "$scope" in
+    only)
+      local here parent base
+      here="${branch:-$(current_branch)}"
+      parent="$(stack_parent "$here")"
+      base="$(stack_base "$here")"
+      run git rebase --onto "$parent" "$base" "$here"
+      ;;
+    downstack) run gh stack rebase --downstack --no-trunk ${extra[@]+"${extra[@]}"} ;;
+    upstack)   run gh stack rebase --upstack --no-trunk ${extra[@]+"${extra[@]}"} ;;
+    *)         run gh stack rebase --no-trunk ${extra[@]+"${extra[@]}"} ;;
+  esac
+
+  [ -z "$origin" ] || run gh stack checkout "$origin"
+}
+
+cmd_submit() {
+  local auto=0 open=0 restack=0 update_only=0 remote=""
+  local dry=0 confirm_first=0 view=0 comment="" reviewers="" team_reviewers=""
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d|--draft)            auto=1; shift ;;
+      -p|--publish)          open=1; shift ;;
+      -n|--no-edit)          auto=1; shift ;;
+      -e|--edit)             auto=0; shift ;;
+      --restack)             restack=1; shift ;;
+      -u|--update-only)      update_only=1; shift ;;
+      -r|--reviewers)        need_value "$1" "${2:-}"; reviewers="$2"; shift 2 ;;
+      --reviewers=*)         reviewers="${1#*=}"; shift ;;
+      -t|--team-reviewers)   need_value "$1" "${2:-}"; team_reviewers="$2"; shift 2 ;;
+      --team-reviewers=*)    team_reviewers="${1#*=}"; shift ;;
+      --comment)             need_value "$1" "${2:-}"; comment="$2"; shift 2 ;;
+      --comment=*)           comment="${1#*=}"; shift ;;
+      -v|--view)             view=1; shift ;;
+      --dry-run)             dry=1; shift ;;
+      -c|--confirm)          confirm_first=1; shift ;;
+      --remote)              need_value "$1" "${2:-}"; remote="$2"; shift 2 ;;
+      --remote=*)            remote="${1#*=}"; shift ;;
+      -s|--stack)            shift ;;   # gh always submits the whole stack
+      --no-stack)            unsupported "gh stack submit cannot narrow to part of a stack" ;;
+      -f|--force)            unsupported "gh stack push always uses --force-with-lease; a plain force push is not available" ;;
+      --always)              unsupported "gh stack submit has no equivalent of Graphite's --always" ;;
+      --ai|--no-ai)          unsupported "$1 has no gh stack equivalent; titles come from gh's editor or --auto" ;;
+      --edit-title|--no-edit-title|--edit-description|--no-edit-description)
+                             unsupported "$1 has no gh stack equivalent; gh's submit editor covers title and description together" ;;
+      -m|--merge-when-ready) unsupported "-m/--merge-when-ready is not available; see 'gho stack merge' or 'gh pr merge --auto'" ;;
+      -w|--web|--cli)        unsupported "$1 has no gh stack equivalent; gh's submit editor is a terminal UI" ;;
+      --target-trunk)        unsupported "--target-trunk has no gh stack equivalent; set the base with 'gh stack init --base'" ;;
+      --ignore-out-of-sync-trunk) unsupported "--ignore-out-of-sync-trunk has no gh stack equivalent" ;;
+      --branch)              unsupported "--branch has no gh stack equivalent; check the branch out first" ;;
+      --rerequest-review)    unsupported "--rerequest-review has no gh stack equivalent; use 'gh pr edit --add-reviewer'" ;;
+      -*)                    unsupported "unknown flag $1 (see 'gho stack submit --help')" ;;
+      *)                     unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  require_git_repo
+
+  local submit
+  if [ "$update_only" = 1 ]; then
+    if [ "$auto" = 1 ] || [ "$open" = 1 ]; then
+      unsupported "-u/--update-only opens no PRs, so --draft/--publish/--no-edit do not apply"
+    fi
+    submit=(gh stack push)
+  else
+    submit=(gh stack submit)
+    [ "$auto" = 0 ] || submit+=(--auto)
+    [ "$open" = 0 ] || submit+=(--open)
+    # gh's submit editor cannot run without a terminal.
+    if [ "$auto" = 0 ] && [ "$INTERACTIVE" = 0 ]; then submit+=(--auto); fi
+  fi
+  [ -z "$remote" ] || submit+=(--remote "$remote")
+
+  if [ "$dry" = 1 ] || [ "$confirm_first" = 1 ]; then
+    [ "$restack" = 0 ] || trace gh stack rebase --no-trunk
+    trace "${submit[@]}"
+    if [ "$dry" = 1 ]; then
+      note "--dry-run: nothing was pushed and no PRs were opened or updated"
+      return 0
+    fi
+    confirm "submit this stack?"
+  fi
+
+  [ "$restack" = 0 ] || run gh stack rebase --no-trunk
+  run "${submit[@]}"
+
+  if [ -n "$reviewers" ] || [ -n "$team_reviewers" ]; then
+    local name edit
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      edit=(gh pr edit "$name")
+      [ -z "$reviewers" ] || edit+=(--add-reviewer "$reviewers")
+      [ -z "$team_reviewers" ] || edit+=(--add-reviewer "$team_reviewers")
+      run "${edit[@]}" || note "could not set reviewers on '$name' (no PR yet?)"
+    done <<EOF
+$(stack_field names)
+EOF
+  fi
+
+  [ -z "$comment" ] || run gh pr comment --body "$comment"
+  [ "$view" = 0 ] || run gh pr view --web
+}
+
+cmd_log() {
+  local form="default" reverse=0 json=0
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      short|long)          form="$1"; shift ;;
+      -r|--reverse)        reverse=1; shift ;;
+      --json)              json=1; shift ;;
+      -s|--stack)          shift ;;   # gh stack view is stack-scoped already
+      --classic)           unsupported "--classic is a Graphite rendering mode" ;;
+      -n|--steps)          unsupported "-n/--steps has no gh stack equivalent" ;;
+      -u|--show-untracked) unsupported "-u/--show-untracked has no gh stack equivalent; gh only knows tracked stacks" ;;
+      -a|--all)            unsupported "-a/--all spans every configured trunk, which gh stack has no notion of" ;;
+      -*)                  unsupported "unknown flag $1 (see 'gho stack log --help')" ;;
+      *)                   unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  if [ "$json" = 1 ]; then run_exec gh stack view --json; return 0; fi
+
+  if [ "$form" = long ]; then
+    local trunk
+    trunk="$(stack_field trunk)"
+    run_exec git log --graph --oneline --decorate "$trunk..HEAD"
+    return 0
+  fi
+
+  local view=(gh stack view)
+  [ "$form" != short ] || view+=(--short)
+
+  if [ "$reverse" = 1 ]; then
+    if [ "$DRY_RUN" = 1 ] || [ "$DEBUG" = 1 ]; then trace "${view[@]}"; fi
+    if [ "$DRY_RUN" = 1 ]; then return 0; fi
+    "${view[@]}" | awk '{ line[NR] = $0 } END { for (i = NR; i > 0; i--) print line[i] }'
+    return 0
+  fi
+
+  run_exec "${view[@]}"
+}
+
+cmd_checkout() {
+  local target="" trunk=0
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--trunk)          trunk=1; shift ;;
+      -s|--stack)          shift ;;   # gh's picker is stack-scoped already
+      -u|--show-untracked) unsupported "-u/--show-untracked has no gh stack equivalent; use 'git checkout'" ;;
+      -a|--all)            unsupported "-a/--all spans every configured trunk, which gh stack has no notion of" ;;
+      -*)                  unsupported "unknown flag $1 (see 'gho stack checkout --help')" ;;
+      *)                   [ -z "$target" ] || unsupported "only one branch is accepted"; target="$1"; shift ;;
+    esac
+  done
+
+  if [ "$trunk" = 1 ]; then run_exec gh stack trunk; return 0; fi
+  if [ -n "$target" ]; then run_exec gh stack checkout "$target"; return 0; fi
+  run_exec gh stack switch
+}
+
+cmd_move_vertically() { # $1 = up|down
+  local dir="$1" steps=""
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--steps)   need_value "$1" "${2:-}"; steps="$2"; shift 2 ;;
+      --steps=*)    steps="${1#*=}"; shift ;;
+      -n[0-9]*)     steps="${1#-n}"; shift ;;
+      --to)         unsupported "--to has no gh stack equivalent; use 'gho stack checkout <branch>'" ;;
+      -*)           unsupported "unknown flag $1 (see 'gho stack $dir --help')" ;;
+      *)            [ -z "$steps" ] || unsupported "give the step count once"; steps="$1"; shift ;;
+    esac
+  done
+  if [ -n "$steps" ]; then run_exec gh stack "$dir" "$steps"; else run_exec gh stack "$dir"; fi
+}
+
+cmd_squash() {
+  local edit=1
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--message)  need_value "$1" "${2:-}"; MESSAGES+=("$2"); shift 2 ;;
+      --message=*)   MESSAGES+=("${1#*=}"); shift ;;
+      -n|--no-edit)  edit=0; shift ;;
+      --edit)        edit=1; shift ;;
+      -*)            unsupported "unknown flag $1 (see 'gho stack squash --help')" ;;
+      *)             unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  require_git_repo
+  local branch base
+  branch="$(current_branch)"
+  base="$(stack_base "$branch")"
+
+  if [ "$DRY_RUN" != 1 ]; then
+    git diff --quiet && git diff --cached --quiet ||
+      die "stack squash: commit or stash your changes first — squash only touches commits"
+  fi
+
+  # Collect the messages before the reset, while the commits are still reachable.
+  local template=""
+  if [ ${#MESSAGES[@]} -eq 0 ]; then
+    template="$(git rev-parse --absolute-git-dir)/gho-squash-msg"
+    if [ "$DRY_RUN" != 1 ]; then
+      git log --reverse --format='%B' "$base..$branch" |
+        awk 'NF { blank = 0 } !NF { blank++ } !(blank > 1) { print }' >"$template"
+      [ -s "$template" ] || die "stack squash: '$branch' has no commits of its own to squash"
+    fi
+  fi
+
+  snapshot "squash $branch"
+  run git reset --soft "$base"
+
+  COMMIT=(git commit)
+  [ "$VERIFY" = 1 ] || COMMIT+=(--no-verify)
+
+  if [ -z "$template" ]; then
+    append_messages
+    run "${COMMIT[@]}"
+  else
+    [ "$edit" = 0 ] || COMMIT+=(--edit)
+    COMMIT+=(--file "$template")
+    run "${COMMIT[@]}"
+    [ "$DRY_RUN" = 1 ] || rm -f "$template"
+  fi
+
+  run gh stack rebase --upstack --no-trunk
+}
+
+cmd_undo() {
+  local force=0
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*)         unsupported "unknown flag $1 (see 'gho stack undo --help')" ;;
+      *)          unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+
+  require_git_repo
+  local dir latest
+  dir="$(git rev-parse --absolute-git-dir)/gho/undo"
+  latest="$(ls -1t "$dir" 2>/dev/null | head -1 || true)"
+  [ -n "$latest" ] || die "stack undo: no gho stack snapshot to restore"
+
+  local label branch sha head=""
+  label="$(sed -n '1s/^# //p' "$dir/$latest")"
+  note "restoring branch tips from before: $label"
+
+  while IFS=$'\t' read -r branch sha; do
+    case "$branch" in ''|'#'*) continue ;; esac
+    if [ "$branch" = "HEAD-branch" ]; then head="$sha"; continue; fi
+    printf '  %s -> %s\n' "$branch" "$sha" >&2
+  done <"$dir/$latest"
+
+  [ "$force" = 1 ] || confirm "reset these branches?"
+
+  while IFS=$'\t' read -r branch sha; do
+    case "$branch" in ''|'#'*) continue ;; esac
+    [ "$branch" != "HEAD-branch" ] || continue
+    run git update-ref "refs/heads/$branch" "$sha"
+  done <"$dir/$latest"
+
+  [ -z "$head" ] || run git checkout --quiet "$head"
+  [ "$DRY_RUN" = 1 ] || rm -f "$dir/$latest"
+  note "gh's stack metadata was not changed — 'gho stack log' should still be right"
+}
+
+cmd_get() {
+  local target="" checkout=1 restack=1 prune=0
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --checkout)          checkout=1; shift ;;
+      --no-checkout)       checkout=0; shift ;;
+      --restack)           restack=1; shift ;;
+      --no-restack)        restack=0; shift ;;
+      --delete-all)        prune=1; shift ;;
+      -f|--force)          shift ;;   # gh already treats the remote as truth
+      -d|--downstack)      unsupported "-d/--downstack has no gh stack equivalent; gh fetches the whole stack" ;;
+      -u|--remote-upstack) unsupported "-u/--remote-upstack has no gh stack equivalent; gh fetches the whole stack" ;;
+      -U|--unfrozen)       unsupported "-U/--unfrozen refers to Graphite's freeze, which gh stack has no notion of" ;;
+      -*)                  unsupported "unknown flag $1 (see 'gho stack get --help')" ;;
+      *)                   [ -z "$target" ] || unsupported "only one branch or PR is accepted"; target="$1"; shift ;;
+    esac
+  done
+
+  require_git_repo
+  local origin=""
+  [ "$checkout" = 1 ] || origin="$(current_branch)"
+
+  if [ -n "$target" ]; then run gh stack checkout "$target"; else run gh stack checkout; fi
+  [ "$restack" = 0 ] || run gh stack rebase
+  [ "$prune" = 0 ] || run gh stack sync --prune
+  [ -z "$origin" ] || run gh stack checkout "$origin"
+}
+
+cmd_track() {
+  local parent="" branches=()
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--parent) need_value "$1" "${2:-}"; parent="$2"; shift 2 ;;
+      --parent=*)  parent="${1#*=}"; shift ;;
+      -f|--force)  shift ;;   # gh stack init does not prompt
+      -*)          unsupported "unknown flag $1 (see 'gho stack track --help')" ;;
+      *)           branches+=("$1"); shift ;;
+    esac
+  done
+
+  require_git_repo
+  [ ${#branches[@]} -gt 0 ] || branches=("$(current_branch)")
+  local init=(gh stack init)
+  [ -z "$parent" ] || init+=(--base "$parent")
+  run "${init[@]}" "${branches[@]}"
+}
+
+cmd_untrack() {
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) shift ;;
+      -*)         unsupported "unknown flag $1 (see 'gho stack untrack --help')" ;;
+      *)          unsupported "gh stack unstack works on the whole stack, not one branch" ;;
+    esac
+  done
+  note "gh untracks the whole stack, not a single branch"
+  run_exec gh stack unstack --local
+}
+
+cmd_continue() {
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -a|--all) run git add -A; shift ;;
+      -*)       unsupported "unknown flag $1 (see 'gho stack continue --help')" ;;
+      *)        unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+  if ! run gh stack rebase --continue; then
+    die "if you were restructuring the stack, continue that instead: gh stack modify --continue"
+  fi
+}
+
+cmd_abort() {
+  local force=0
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*)         unsupported "unknown flag $1 (see 'gho stack abort --help')" ;;
+      *)          unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+  [ "$force" = 1 ] || confirm "abort the rebase and restore all branches?"
+  run_exec gh stack rebase --abort
+}
+
+cmd_restructure() {
+  set -- ${ARGV[@]+"${ARGV[@]}"}
+  local pass=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --abort|--continue) pass+=("$1"); shift ;;
+      -*)                 unsupported "unknown flag $1 (see 'gho stack restructure --help')" ;;
+      *)                  unsupported "unexpected argument '$1'" ;;
+    esac
+  done
+  run_exec gh stack modify ${pass[@]+"${pass[@]}"}
+}
+
+# fold, move, reorder, rename, delete, split, insert — gh's stack editor is the
+# only thing that does these while keeping its own metadata consistent.
+cmd_structural() { # $1 = verb, $2 = what to pick in the editor
+  note "gh stack has no non-interactive '$1'; opening its stack editor — $2"
+  note "(this is 'gh stack modify'; 'gho stack modify' is Graphite's amend)"
+  run_exec gh stack modify
+}
+
+cmd_pop() {
+  cat >&2 <<'EOF'
+gho: stack pop: gh stack has no single-command pop. Two steps do it:
+
+    git reset --soft "$(gho stack log --json | jq -r '.branches[] | select(.isCurrent).base')"
+    gho stack restructure     # then drop the now-empty branch
+
+The reset leaves this branch's changes in your working tree; the stack editor
+then removes the branch, which is the only way to keep gh's metadata right.
+EOF
+  exit 1
+}
+
+# --------------------------------------------------------------- dispatchers
+
+stack_dispatch() {
+  local verb="${1:-}"
+  [ $# -eq 0 ] || shift
+
+  case "$verb" in
+    ''|-h|--help|help) stack_help; return 0 ;;
+  esac
+
+  if wants_help "$@"; then
+    if verb_help "$verb"; then return 0; fi
+  fi
+
+  # Every stack verb, whether gho's or gh's, needs the whole toolchain.
+  require_deps
+
+  # Verbs gho implements itself. Anything else is gh's.
+  case "$verb" in
+    create|c|modify|m|sync|restack|r|submit|s|ss|log|ls|ll|checkout|co|up|u|down|d|\
+top|t|bottom|b|trunk|squash|sq|undo|get|track|tr|untrack|utr|continue|abort|\
+restructure|fold|pop|move|reorder|rename|delete|split|sp|insert|absorb|ab|\
+freeze|unfreeze) ;;
+    *) run_exec gh stack "$verb" ${@+"$@"}; return 0 ;;
+  esac
+
+  VERB="$verb"
+  expand_shorts ${@+"$@"}
+  parse_globals ${ARGV[@]+"${ARGV[@]}"}
+
+  if [ -n "$CWD" ]; then cd "$CWD" || die "cannot cd to '$CWD'"; fi
+  if [ "$DEBUG" = 1 ]; then note "gho $GHO_VERSION: stack $verb"; fi
+
+  case "$verb" in
+    create|c)     cmd_create ;;
+    modify|m)     cmd_modify ;;
+    sync)         cmd_sync ;;
+    restack|r)    cmd_restack ;;
+    submit|s)     cmd_submit ;;
+    ss)           cmd_submit ;;   # gh always submits the whole stack
+    log)          cmd_log ;;
+    ls)           ARGV=(short ${ARGV[@]+"${ARGV[@]}"}); cmd_log ;;
+    ll)           ARGV=(long ${ARGV[@]+"${ARGV[@]}"}); cmd_log ;;
+    checkout|co)  cmd_checkout ;;
+    up|u)         cmd_move_vertically up ;;
+    down|d)       cmd_move_vertically down ;;
+    top|t)        run_exec gh stack top ;;
+    bottom|b)     run_exec gh stack bottom ;;
+    trunk)        run_exec gh stack trunk ;;
+    squash|sq)    cmd_squash ;;
+    undo)         cmd_undo ;;
+    get)          cmd_get ;;
+    track|tr)     cmd_track ;;
+    untrack|utr)  cmd_untrack ;;
+    continue)     cmd_continue ;;
+    abort)        cmd_abort ;;
+    restructure)  cmd_restructure ;;
+    fold)         cmd_structural fold "choose Fold" ;;
+    move)         cmd_structural move "reorder the branches" ;;
+    reorder)      cmd_structural reorder "reorder the branches" ;;
+    rename)       cmd_structural rename "choose Rename" ;;
+    delete)       cmd_structural delete "choose Drop" ;;
+    insert)       cmd_structural insert "choose Insert" ;;
+    split|sp)     die "stack split: gh stack has no split; slice the branch with 'git rebase -i' and then insert branches with 'gho stack restructure'" ;;
+    pop)          cmd_pop ;;
+    absorb|ab)    die "stack absorb: not supported — nothing in gh stack or git works out which downstack commit each hunk belongs to. Amend into a branch you name instead: gho stack modify --into <branch>" ;;
+    freeze|unfreeze) die "stack $verb: freezing is a Graphite metadata concept; gh stack has no equivalent" ;;
+  esac
+}
+
+main() {
+  case "${1:-}" in
+    doctor)
+      cmd_doctor
+      return $?
+      ;;
+    stack)
+      shift
+      stack_dispatch ${@+"$@"}
+      ;;
+    ''|-h|--help|help)
+      top_help
+      printf '\n'
+      gh help 2>/dev/null || true
+      ;;
+    --version)
+      printf 'gho %s\n' "$GHO_VERSION"
+      gh --version | head -1
+      gh stack --version 2>/dev/null || true
+      ;;
+    *)
+      command -v gh >/dev/null 2>&1 ||
+        die "the GitHub CLI is not on PATH — brew install gh, or run bin/install.sh"
+      run_exec gh ${@+"$@"}
+      ;;
+  esac
+}
+
+main ${@+"$@"}
